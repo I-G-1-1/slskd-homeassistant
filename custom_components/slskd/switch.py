@@ -21,8 +21,9 @@ class SlskdConnectionSwitch(CoordinatorEntity, SwitchEntity):
     def __init__(self, coordinator: SlskdDataUpdateCoordinator):
         super().__init__(coordinator)
         self._attr_name = "slskd Connection"
-        self._attr_unique_id = "slskd_connection_switch"
+        self._attr_unique_id = f"{coordinator.uid_prefix}_connection_switch"
         self._attr_icon = "mdi:connection"
+        self._attr_device_info = coordinator.device_info
 
     @property
     def is_on(self) -> bool:

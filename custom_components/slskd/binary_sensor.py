@@ -7,6 +7,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity import DeviceInfo
 
 from .const import DOMAIN, CONF_HOST, CONF_API_KEY, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
 
@@ -17,9 +18,21 @@ class SlskdDataUpdateCoordinator(DataUpdateCoordinator):
     """Coordinator to fetch slskd server state with automatic polling and debug logging."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry):
+        self.entry = entry
+        self.entry_id = entry.entry_id
+        self.uid_prefix = f"slskd_{entry.entry_id}"
+
         self.client = SlskdClient(
             host=entry.data[CONF_HOST],
             api_key=entry.data[CONF_API_KEY],
+        )
+
+        self.device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.data[CONF_HOST])},
+            name="slskd Server",
+            manufacturer="slskd",
+            model="Soulseek Client",
+            configuration_url=entry.data[CONF_HOST],
         )
         self.last_search_id: str | None = None
         self.last_search_result_count: int | None = None
@@ -31,6 +44,16 @@ class SlskdDataUpdateCoordinator(DataUpdateCoordinator):
         self.last_download_bytes_transferred: int | None = None
         self.last_download_size: int | None = None
         self.last_download_average_speed: float | None = None
+        self.active_downloads_count: int = 0
+        self.completed_downloads_count: int = 0
+        self.queued_downloads_count: int = 0
+        self.errored_downloads_count: int = 0
+        self.total_downloads_count: int = 0
+        self.download_progress_pct: float = 0.0
+        self.active_uploads_count: int = 0
+        self.shared_files_count: int = 0
+        self.current_download_speed_bps: float = 0.0
+        self.current_upload_speed_bps: float = 0.0
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
         super().__init__(
             hass,
@@ -41,7 +64,7 @@ class SlskdDataUpdateCoordinator(DataUpdateCoordinator):
         )
 
     async def async_update_data(self):
-        """Fetch data from slskd and log each poll."""
+        """Fetch data from slskd, including the latest search and download."""
         _LOGGER.debug("Fetching slskd server state...")
         try:
             data = await self.hass.async_add_executor_job(self.client.server.state)
@@ -49,51 +72,176 @@ class SlskdDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Error fetching slskd server state: %s", err)
             raise UpdateFailed from err
 
-        if self.last_search_id:
-            try:
-                search_state = await self.hass.async_add_executor_job(
-                    self.client.searches.state, self.last_search_id
+        # --- Latest search ---
+        try:
+            searches = await self.hass.async_add_executor_job(
+                self.client.searches.get_all
+            )
+            if searches:
+                latest = max(
+                    searches,
+                    key=lambda s: s.get("startedAt") or "",
                 )
-                self.last_search_result_count = search_state.get("fileCount")
-                self.last_search_state = search_state.get("state")
-                _LOGGER.debug(
-                    "Search %s state=%s file_count=%s",
-                    self.last_search_id,
-                    self.last_search_state,
-                    self.last_search_result_count,
+                self.last_search_id = latest.get("id")
+                self.last_search_result_count = (
+                    latest.get("fileCount")
+                    or latest.get("file_count")
+                    or 0
                 )
+                self.last_search_state = latest.get("state") or "Unknown"
 
-                if self.last_search_state and self.last_search_state.startswith("Completed") and self.last_search_results is None:
+                if (
+                    self.last_search_state
+                    and self.last_search_state.startswith("Completed")
+                ):
                     responses = await self.hass.async_add_executor_job(
-                        self.client.searches.search_responses, self.last_search_id
+                        self.client.searches.search_responses,
+                        self.last_search_id,
                     )
                     self.last_search_results = _extract_top_results(responses)
-                    _LOGGER.debug("Stored %d top results", len(self.last_search_results))
-            except Exception as err:
-                _LOGGER.warning(
-                    "Could not fetch search results for %s: %s", self.last_search_id, err
-                )
+        except Exception as err:
+            _LOGGER.warning("Could not fetch searches: %s", err)
 
-        if self.last_download_username and self.last_download_filename:
-            try:
-                downloads = await self.hass.async_add_executor_job(
-                    self.client.transfers.get_downloads, self.last_download_username
+        # --- Latest download ---
+        try:
+            all_downloads = await self.hass.async_add_executor_job(
+                self.client.transfers.get_all_downloads
+            )
+            best = None
+            for user_obj in all_downloads or []:
+                username = user_obj.get("username")
+                for directory in user_obj.get("directories", []):
+                    for f in directory.get("files", []):
+                        ts = (
+                            f.get("startedAt")
+                            or f.get("enqueuedAt")
+                            or ""
+                        )
+                        if best is None or ts > best[0]:
+                            best = (ts, username, f)
+            if best:
+                _, username, f = best
+                self.last_download_username = username
+                self.last_download_filename = f.get("filename")
+                self.last_download_state = f.get("state") or "Unknown"
+                self.last_download_bytes_transferred = (
+                    f.get("bytesTransferred")
+                    or f.get("bytes_transferred")
+                    or 0
                 )
-                transfer = _find_download(downloads, self.last_download_filename)
-                if transfer:
-                    self.last_download_state = transfer.get("state")
-                    self.last_download_bytes_transferred = transfer.get("bytesTransferred")
-                    self.last_download_size = transfer.get("size")
-                    self.last_download_average_speed = transfer.get("averageSpeed")
-                    _LOGGER.debug(
-                        "Download %s state=%s bytes=%s/%s",
-                        self.last_download_filename,
-                        self.last_download_state,
-                        self.last_download_bytes_transferred,
-                        self.last_download_size,
+                self.last_download_size = f.get("size") or 0
+                self.last_download_average_speed = (
+                    f.get("averageSpeed")
+                    or f.get("average_speed")
+                    or 0.0
+                )
+                _LOGGER.debug(
+                    "Latest download: %s from %s state=%s",
+                    self.last_download_filename,
+                    username,
+                    self.last_download_state,
+                )
+        except Exception as err:
+            _LOGGER.warning("Could not fetch downloads: %s", err)
+
+        # --- Download statistics ---
+        active_dl = 0
+        completed_dl = 0
+        queued_dl = 0
+        errored_dl = 0
+        total_dl_speed = 0.0
+        try:
+            all_downloads = await self.hass.async_add_executor_job(
+                self.client.transfers.get_all_downloads
+            )
+            for user_obj in all_downloads or []:
+                for directory in user_obj.get("directories", []):
+                    for f in directory.get("files", []):
+                        state = f.get("state") or ""
+                        if state == "InProgress":
+                            active_dl += 1
+                            total_dl_speed += (
+                                f.get("averageSpeed")
+                                or f.get("average_speed")
+                                or 0
+                            )
+                        elif state == "Queued" or state.startswith("Queued"):
+                            queued_dl += 1
+                        elif state.startswith("Completed, Succeeded"):
+                            completed_dl += 1
+                        elif state.startswith("Completed, Errored") or state == "Errored":
+                            errored_dl += 1
+                        # "Completed, Cancelled" is not counted in any category
+        except Exception as err:
+            _LOGGER.warning("Could not fetch downloads: %s", err)
+
+        self.active_downloads_count = active_dl
+        self.completed_downloads_count = completed_dl
+        self.queued_downloads_count = queued_dl
+        self.errored_downloads_count = errored_dl
+        self.total_downloads_count = active_dl + completed_dl + queued_dl + errored_dl
+
+        # Progress: completed / (completed + active + queued + errored)
+        denom = completed_dl + active_dl + queued_dl + errored_dl
+        self.download_progress_pct = (
+            round(completed_dl / denom * 100, 1) if denom > 0 else 0.0
+        )
+        self.current_download_speed_bps = total_dl_speed
+
+        # --- Upload statistics ---
+        active_ul = 0
+        total_ul_speed = 0.0
+        try:
+            all_uploads = await self.hass.async_add_executor_job(
+                self.client.transfers.get_all_uploads
+            )
+            for user_obj in all_uploads or []:
+                for directory in user_obj.get("directories", []):
+                    for f in directory.get("files", []):
+                        state = f.get("state") or ""
+                        if state == "InProgress":
+                            active_ul += 1
+                            total_ul_speed += (
+                                f.get("averageSpeed")
+                                or f.get("average_speed")
+                                or 0
+                            )
+        except Exception as err:
+            _LOGGER.warning("Could not fetch uploads: %s", err)
+
+        self.active_uploads_count = active_ul
+        self.current_upload_speed_bps = total_ul_speed
+
+        # --- Shared files ---
+        try:
+            shares_data = await self.hass.async_add_executor_job(
+                self.client.shares.get_all
+            )
+            total_files = 0
+
+            # The response can be a dict with "local" and "remote",
+            # or a list of share objects.
+            if isinstance(shares_data, dict):
+                # Dict case: sum files from "local" and "remote"
+                for key in ("local", "remote"):
+                    for s in shares_data.get(key) or []:
+                        total_files += (
+                            s.get("files")
+                            or s.get("fileCount")
+                            or 0
+                        )
+            elif isinstance(shares_data, list):
+                # List case: iterate directly
+                for s in shares_data:
+                    total_files += (
+                        s.get("files")
+                        or s.get("fileCount")
+                        or 0
                     )
-            except Exception as err:
-                _LOGGER.warning("Could not fetch download status: %s", err)
+
+            self.shared_files_count = total_files
+        except Exception as err:
+            _LOGGER.warning("Could not fetch shares: %s", err)
 
         return data
 
@@ -158,7 +306,8 @@ class SlskdConnectionBinarySensor(BinarySensorEntity):
 
     def __init__(self, coordinator: SlskdDataUpdateCoordinator):
         self.coordinator = coordinator
-        self._attr_unique_id = "slskd_connected"
+        self._attr_unique_id = f"{coordinator.uid_prefix}_connected"
+        self._attr_device_info = coordinator.device_info
 
     async def async_added_to_hass(self):
         """Register entity with coordinator to receive updates automatically."""

@@ -17,6 +17,8 @@ class SlskdConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             host = user_input[CONF_HOST]
             api_key = user_input[CONF_API_KEY]
+            await self.async_set_unique_id(host)
+            self._abort_if_unique_id_configured()
 
             # Test connection
             try:

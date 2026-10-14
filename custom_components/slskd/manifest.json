@@ -1,10 +1,10 @@
 {
   "domain": "slskd",
-  "name": "slskd Server integration",
-  "version": "0.7.0",
+  "name": "Slskd",
+  "version": "0.8.0",
   "documentation": "https://github.com/kaymyst/slskd-homeassistant",
   "requirements": [
-    "slskd-api>=0.1.5"
+    "slskd-api>=0.2.4"
   ],
   "codeowners": [
     "@kaymyst"
@@ -12,7 +12,8 @@
   "iot_class": "local_polling",
   "config_flow": true,
   "platforms": [
-    "binary_sensor",
-    "switch"
+    "binary_sensor", 
+    "switch", 
+    "sensor"
   ]
 }

@@ -13,6 +13,7 @@ _LOGGER = logging.getLogger(__name__)
 SEARCH_SERVICE = "search"
 SEARCH_SERVICE_SCHEMA = vol.Schema({
     vol.Required("search_text"): cv.string,
+    vol.Optional("entry_id"): cv.string,
 })
 
 DOWNLOAD_SERVICE = "download"
@@ -20,12 +21,25 @@ DOWNLOAD_SERVICE_SCHEMA = vol.Schema({
     vol.Required("username"): cv.string,
     vol.Required("filename"): cv.string,
     vol.Optional("size"): vol.Coerce(int),
+    vol.Optional("entry_id"): cv.string,
 })
 
 
 async def async_setup(hass: HomeAssistant, config: dict):
     """Set up the integration (nothing to do for YAML)."""
     return True
+
+
+def _resolve_coordinator(hass: HomeAssistant, entry_id: str | None):
+    """Return the coordinator for the given entry_id, or the only one available."""
+    coordinators = hass.data.get(DOMAIN, {})
+    if entry_id:
+        return coordinators.get(entry_id)
+    # If not specified, use the only configured one
+    if len(coordinators) == 1:
+        return next(iter(coordinators.values()))
+    return None
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up slskd from a config entry."""
@@ -51,12 +65,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
-    # Forward to binary_sensor platform (awaited)
-    await hass.config_entries.async_forward_entry_setups(entry, ["binary_sensor", "switch", "sensor"])
+    # Forward to platforms
+    await hass.config_entries.async_forward_entry_setups(
+        entry, ["binary_sensor", "switch", "sensor"]
+    )
 
     async def handle_search(call: ServiceCall) -> None:
         """Initiate a search on the slskd server."""
         search_text = call.data["search_text"]
+        entry_id = call.data.get("entry_id")
+        coordinator = _resolve_coordinator(hass, entry_id)
+        if coordinator is None:
+            _LOGGER.error(
+                "No slskd instance found (or multiple without entry_id). "
+                "Specify entry_id in the service call."
+            )
+            return
         _LOGGER.debug("Initiating slskd search for: %s", search_text)
         try:
             result = await hass.async_add_executor_job(
@@ -80,7 +104,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         username = call.data["username"]
         filename = call.data["filename"]
         size = call.data.get("size")
-        _LOGGER.debug("Enqueueing download: %s from %s (size=%s)", filename, username, size)
+        entry_id = call.data.get("entry_id")
+        coordinator = _resolve_coordinator(hass, entry_id)
+        if coordinator is None:
+            _LOGGER.error(
+                "No slskd instance found (or multiple without entry_id). "
+                "Specify entry_id in the service call."
+            )
+            return
+        _LOGGER.debug("Enqueueing download: %s from %s", filename, username)
         file_entry = {"filename": filename}
         if size is not None:
             file_entry["size"] = size
@@ -106,3 +138,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         )
 
     return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    # Unload platforms used by the integration
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        entry, ["binary_sensor", "sensor", "switch"]
+    )
+    if unload_ok:
+        # Remove the coordinator from Home Assistant data
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+    return unload_ok
