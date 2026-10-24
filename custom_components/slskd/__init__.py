@@ -1,18 +1,29 @@
 from datetime import timedelta
+
+import voluptuous as vol
+import homeassistant.helpers.config_validation as cv
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryNotReady
-import voluptuous as vol
-import homeassistant.helpers.config_validation as cv
-from .const import DOMAIN, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
-from .binary_sensor import SlskdDataUpdateCoordinator
 import logging
+
+from .const import (
+    DOMAIN,
+    CONF_HOST,
+    CONF_API_KEY,
+    CONF_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL,
+    CONF_API_KEY_ROLE,
+    DEFAULT_API_KEY_ROLE,
+)
+from .binary_sensor import SlskdDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
 SEARCH_SERVICE = "search"
 SEARCH_SERVICE_SCHEMA = vol.Schema({
     vol.Required("search_text"): cv.string,
+    vol.Optional("entry_id"): cv.string,
 })
 
 DOWNLOAD_SERVICE = "download"
@@ -20,21 +31,77 @@ DOWNLOAD_SERVICE_SCHEMA = vol.Schema({
     vol.Required("username"): cv.string,
     vol.Required("filename"): cv.string,
     vol.Optional("size"): vol.Coerce(int),
+    vol.Optional("entry_id"): cv.string,
 })
+
+
+def _get_role(entry: ConfigEntry) -> str:
+    """Return the configured API key role for a config entry."""
+    return entry.options.get(
+        CONF_API_KEY_ROLE,
+        entry.data.get(CONF_API_KEY_ROLE, DEFAULT_API_KEY_ROLE),
+    )
+
+
+async def _detect_role(hass: HomeAssistant, entry: ConfigEntry) -> str:
+    """Probe the server to determine the API key role (used for old entries)."""
+    from slskd_api import SlskdClient
+
+    probe = SlskdClient(
+        host=entry.data[CONF_HOST],
+        api_key=entry.data[CONF_API_KEY],
+    )
+    try:
+        await hass.async_add_executor_job(probe.server.state)
+        return "readwrite"
+    except Exception:
+        # Not readwrite — try a lightweight read-only endpoint
+        try:
+            await hass.async_add_executor_job(probe.transfers.get_all_downloads)
+            return "readonly"
+        except Exception as err:
+            _LOGGER.error("Unable to authenticate with slskd: %s", err)
+            raise ConfigEntryNotReady from err
 
 
 async def async_setup(hass: HomeAssistant, config: dict):
     """Set up the integration (nothing to do for YAML)."""
     return True
 
+
+def _resolve_coordinator(hass: HomeAssistant, entry_id: str | None):
+    """Return the coordinator for the given entry_id, or the only one available."""
+    coordinators = hass.data.get(DOMAIN, {})
+    if entry_id:
+        return coordinators.get(entry_id)
+    if len(coordinators) == 1:
+        return next(iter(coordinators.values()))
+    return None
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up slskd from a config entry."""
 
-    try:
-        # Create coordinator (includes client)
-        coordinator = SlskdDataUpdateCoordinator(hass, entry)
+    # Resolve the role. Pre-existing entries (upgraded from a version
+    # without the CONF_API_KEY_ROLE field) are probed automatically so
+    # upgraders don't get broken.
+    if CONF_API_KEY_ROLE in entry.options or CONF_API_KEY_ROLE in entry.data:
+        role = _get_role(entry)
+    else:
+        role = await _detect_role(hass, entry)
+        _LOGGER.info(
+            "Detected slskd API key role for %s: %s",
+            entry.data.get(CONF_HOST),
+            role,
+        )
+        # Persist in options so future setups use it without probing.
+        hass.config_entries.async_update_entry(
+            entry,
+            options={**entry.options, CONF_API_KEY_ROLE: role},
+        )
 
-        # Test connection first
+    try:
+        coordinator = SlskdDataUpdateCoordinator(hass, entry, role)
         await coordinator.async_config_entry_first_refresh()
     except Exception as err:
         _LOGGER.error("Failed to connect to slskd server: %s", err)
@@ -43,20 +110,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
-    # Update coordinator interval when options change
     async def _async_options_updated(hass, entry):
-        scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+        # If the role changed, reload so entities are added/removed.
+        new_role = _get_role(entry)
+        if new_role != coordinator.role:
+            _LOGGER.info(
+                "API key role changed from '%s' to '%s' — reloading integration.",
+                coordinator.role,
+                new_role,
+            )
+            hass.async_create_task(
+                hass.config_entries.async_reload(entry.entry_id)
+            )
+            return
+        scan_interval = entry.options.get(
+            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+        )
         coordinator.update_interval = timedelta(seconds=scan_interval)
         await coordinator.async_request_refresh()
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
-    # Forward to binary_sensor platform (awaited)
-    await hass.config_entries.async_forward_entry_setups(entry, ["binary_sensor", "switch", "sensor"])
+    # Forward to platforms
+    await hass.config_entries.async_forward_entry_setups(
+        entry, ["binary_sensor", "switch", "sensor", "button"]
+    )
 
     async def handle_search(call: ServiceCall) -> None:
         """Initiate a search on the slskd server."""
         search_text = call.data["search_text"]
+        entry_id = call.data.get("entry_id")
+        coordinator = _resolve_coordinator(hass, entry_id)
+        if coordinator is None:
+            _LOGGER.error(
+                "No slskd instance found (or multiple without entry_id). "
+                "Specify entry_id in the service call."
+            )
+            return
+        if coordinator.role != "readwrite":
+            _LOGGER.error(
+                "Cannot initiate search: the configured API key has the "
+                "'readonly' role. Set 'api_key_role' to 'readwrite' in the "
+                "integration options and ensure the API key on the slskd "
+                "server has write permissions."
+            )
+            return
         _LOGGER.debug("Initiating slskd search for: %s", search_text)
         try:
             result = await hass.async_add_executor_job(
@@ -80,7 +178,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         username = call.data["username"]
         filename = call.data["filename"]
         size = call.data.get("size")
-        _LOGGER.debug("Enqueueing download: %s from %s (size=%s)", filename, username, size)
+        entry_id = call.data.get("entry_id")
+        coordinator = _resolve_coordinator(hass, entry_id)
+        if coordinator is None:
+            _LOGGER.error(
+                "No slskd instance found (or multiple without entry_id). "
+                "Specify entry_id in the service call."
+            )
+            return
+        if coordinator.role != "readwrite":
+            _LOGGER.error(
+                "Cannot enqueue download: the configured API key has the "
+                "'readonly' role. Set 'api_key_role' to 'readwrite' in the "
+                "integration options and ensure the API key on the slskd "
+                "server has write permissions."
+            )
+            return
+        _LOGGER.debug("Enqueueing download: %s from %s", filename, username)
         file_entry = {"filename": filename}
         if size is not None:
             file_entry["size"] = size
@@ -106,3 +220,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         )
 
     return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        entry, ["binary_sensor", "sensor", "switch"]
+    )
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+    return unload_ok

@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to slskd",
+        "description": "Select 'readonly' if your API key only has read access. Some features (like the connect/disconnect switch and search/download services) will be disabled.",
+        "data": {
+          "host": "Host URL",
+          "api_key": "API Key",
+          "api_key_role": "API Key Role"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect. Check the host and API key, and verify the role matches the key's permissions in slskd."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "scan_interval": "Scan interval (seconds)",
+          "api_key_role": "API Key Role"
+        }
+      }
+    }
+  }
+}

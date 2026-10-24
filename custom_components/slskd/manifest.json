@@ -1,10 +1,10 @@
 {
   "domain": "slskd",
-  "name": "slskd Server integration",
-  "version": "0.7.1",
+  "name": "Slskd",
+  "version": "0.7.2",
   "documentation": "https://github.com/kaymyst/slskd-homeassistant",
   "requirements": [
-    "slskd-api>=0.1.5"
+    "slskd-api>=0.2.4"
   ],
   "codeowners": [
     "@kaymyst"
@@ -13,6 +13,8 @@
   "config_flow": true,
   "platforms": [
     "binary_sensor",
-    "switch"
+    "switch",
+    "sensor",
+    "button"
   ]
 }

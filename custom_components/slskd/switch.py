@@ -7,12 +7,22 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .binary_sensor import SlskdDataUpdateCoordinator
 
+
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ):
     """Set up the switch."""
     coordinator: SlskdDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([SlskdConnectionSwitch(coordinator)])
+
+    entities = []
+    # The connect/disconnect switch requires readwrite privileges in
+    # slskd 0.26.2+. Skip it for readonly.
+    if coordinator.role == "readwrite":
+        entities.append(SlskdConnectionSwitch(coordinator))
+
+    async_add_entities(entities)
 
 
 class SlskdConnectionSwitch(CoordinatorEntity, SwitchEntity):
@@ -21,22 +31,24 @@ class SlskdConnectionSwitch(CoordinatorEntity, SwitchEntity):
     def __init__(self, coordinator: SlskdDataUpdateCoordinator):
         super().__init__(coordinator)
         self._attr_name = "slskd Connection"
-        self._attr_unique_id = "slskd_connection_switch"
+        self._attr_unique_id = f"{coordinator.uid_prefix}_connection_switch"
         self._attr_icon = "mdi:connection"
+        self._attr_device_info = coordinator.device_info
 
     @property
     def is_on(self) -> bool:
-        """Return True if server is connected."""
         if not self.coordinator.data:
             return False
         return self.coordinator.data.get("isConnected", False)
 
     async def async_turn_on(self, **kwargs) -> None:
-        """Turn on the switch."""
-        await self.hass.async_add_executor_job(self.coordinator.client.server.connect)
+        await self.hass.async_add_executor_job(
+            self.coordinator.client.server.connect
+        )
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs) -> None:
-        """Turn off the switch."""
-        await self.hass.async_add_executor_job(self.coordinator.client.server.disconnect)
+        await self.hass.async_add_executor_job(
+            self.coordinator.client.server.disconnect
+        )
         await self.coordinator.async_request_refresh()
