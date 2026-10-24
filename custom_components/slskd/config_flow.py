@@ -21,8 +21,9 @@ class SlskdConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # Test connection
             try:
                 from slskd_api import SlskdClient
+                from .helpers import get_server_state
                 client = SlskdClient(host=host, api_key=api_key)
-                state = await self.hass.async_add_executor_job(client.server.state)
+                state = await self.hass.async_add_executor_job(get_server_state, client)
                 if not state:
                     errors["base"] = "cannot_connect"
             except Exception:

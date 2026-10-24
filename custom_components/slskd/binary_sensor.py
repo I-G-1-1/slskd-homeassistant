@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .helpers import get_server_state
 from .const import DOMAIN, CONF_HOST, CONF_API_KEY, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ class SlskdDataUpdateCoordinator(DataUpdateCoordinator):
         """Fetch data from slskd and log each poll."""
         _LOGGER.debug("Fetching slskd server state...")
         try:
-            data = await self.hass.async_add_executor_job(self.client.server.state)
+            data = await self.hass.async_add_executor_job(get_server_state, self.client)
         except Exception as err:
             _LOGGER.error("Error fetching slskd server state: %s", err)
             raise UpdateFailed from err
